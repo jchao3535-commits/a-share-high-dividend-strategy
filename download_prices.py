@@ -12,10 +12,11 @@ from config import (
 )
 
 
-def select_candidate_codes(top_n_per_period: int = 80) -> list[str]:
+def select_candidate_codes(top_n_overall: int = 80, top_n_per_bucket: int = 45) -> list[str]:
     """
     基于已下载的 22 期截面数据（fhps + yjbb + 历史A股名单），
-    先筛选出每期股息率排名前 top_n_per_period 的候选股票，取并集后按需下载日线。
+    先筛选出全市场前 top_n_overall 以及各市值分组（<100亿, 100-599亿, >=599亿）前 top_n_per_bucket 的候选股票，
+    取并集后按需下载日线。
     """
     sched = pd.read_parquet(DATA_DIR / "rebalance_schedule.parquet")
     candidate_codes = set()
@@ -43,6 +44,7 @@ def select_candidate_codes(top_n_per_period: int = 80) -> list[str]:
         df_fh["symbol"] = df_fh["代码"].astype(str).str.zfill(6)
         df_fh["div_per_10"] = pd.to_numeric(df_fh["现金分红-现金分红比例"], errors="coerce")
         df_fh["div_yield_snap"] = pd.to_numeric(df_fh["现金分红-股息率"], errors="coerce")
+        df_fh["total_shares"] = pd.to_numeric(df_fh["总股本"], errors="coerce")
         df_fh["notice_date"] = pd.to_datetime(df_fh["最新公告日期"], errors="coerce")
         df_fh["plan_date"] = pd.to_datetime(df_fh["预案公告日"], errors="coerce")
         df_fh["eff_date"] = df_fh["notice_date"].fillna(df_fh["plan_date"])
@@ -54,8 +56,6 @@ def select_candidate_codes(top_n_per_period: int = 80) -> list[str]:
             & (df_fh["eff_date"] <= reb_ts)
             & (~df_fh["方案进度"].astype(str).str.contains("不分配|停止|未通过", na=False))
         ].copy()
-
-        # 同一报告期如有多条记录，取最新一条
         df_fh = df_fh.sort_values("eff_date").drop_duplicates("symbol", keep="last")
 
         # 清洗业绩表（过滤亏损陷阱）
@@ -64,23 +64,38 @@ def select_candidate_codes(top_n_per_period: int = 80) -> list[str]:
         df_yj["net_profit"] = pd.to_numeric(df_yj["净利润-净利润"], errors="coerce")
         df_yj = df_yj.drop_duplicates("symbol", keep="last")
 
-        merged = df_st.merge(df_fh[["symbol", "div_per_10", "div_yield_snap"]], on="symbol", how="inner")
+        merged = df_st.merge(
+            df_fh[["symbol", "div_per_10", "div_yield_snap", "total_shares"]],
+            on="symbol",
+            how="inner",
+        )
         merged = merged.merge(df_yj[["symbol", "eps", "net_profit"]], on="symbol", how="left")
 
-        # 过滤异常高股息陷阱：要求净利润为正、EPS为正、快照股息率 <= 20%
         merged = merged[
             (merged["eps"] > 0)
             & (merged["net_profit"] > 0)
             & (merged["div_yield_snap"] > 0)
             & (merged["div_yield_snap"] <= 0.20)
-        ]
+        ].copy()
 
-        top_df = merged.sort_values("div_yield_snap", ascending=False).head(top_n_per_period)
-        candidate_codes.update(top_df["code"].tolist())
-        print(f"[{reb_date} | {period}] 满足初筛 {len(merged)} 只，取前 {len(top_df)} 只入候选池")
+        # 全市场前 N
+        candidate_codes.update(
+            merged.sort_values("div_yield_snap", ascending=False).head(top_n_overall)["code"].tolist()
+        )
+
+        # 按估算快照市值分组各自取前 N
+        merged["est_mc_yi"] = ((merged["div_per_10"] / 10.0) / merged["div_yield_snap"]) * merged["total_shares"] / 1e8
+        for cond in [
+            merged["est_mc_yi"] < 100,
+            (merged["est_mc_yi"] >= 100) & (merged["est_mc_yi"] < 599),
+            merged["est_mc_yi"] >= 599,
+        ]:
+            candidate_codes.update(
+                merged[cond].sort_values("div_yield_snap", ascending=False).head(top_n_per_bucket)["code"].tolist()
+            )
 
     codes = sorted(candidate_codes)
-    print(f"\n📌 10年共 22 期去重后，需要下载日线的候选股票总计: {len(codes)} 只（远少于全市场 5300+ 只）")
+    print(f"📌 10年共 22 期合并市值分组去重后，候选股票总计: {len(codes)} 只")
     return codes
 
 
@@ -101,7 +116,6 @@ def download_stock_prices(codes: list[str]):
                 skipped += 1
                 continue
 
-            # 1. 拉取不复权价格 + PE/PB（用于调仓日计算真实股息率）
             rs_raw = bs.query_history_k_data_plus(
                 code,
                 "date,code,close,volume,tradestatus,peTTM,pbMRQ",
@@ -115,10 +129,8 @@ def download_stock_prices(codes: list[str]):
                 raw_rows.append(rs_raw.get_row_data())
             if not raw_rows:
                 continue
-            df_raw = pd.DataFrame(raw_rows, columns=rs_raw.fields)
-            df_raw.rename(columns={"close": "close_raw"}, inplace=True)
+            df_raw = pd.DataFrame(raw_rows, columns=rs_raw.fields).rename(columns={"close": "close_raw"})
 
-            # 2. 拉取后复权收盘价（用于计算分红再投资的真实持有收益）
             rs_hfq = bs.query_history_k_data_plus(
                 code,
                 "date,close",
@@ -130,8 +142,7 @@ def download_stock_prices(codes: list[str]):
             hfq_rows = []
             while rs_hfq.error_code == "0" and rs_hfq.next():
                 hfq_rows.append(rs_hfq.get_row_data())
-            df_hfq = pd.DataFrame(hfq_rows, columns=rs_hfq.fields)
-            df_hfq.rename(columns={"close": "close_hfq"}, inplace=True)
+            df_hfq = pd.DataFrame(hfq_rows, columns=rs_hfq.fields).rename(columns={"close": "close_hfq"})
 
             df = df_raw.merge(df_hfq, on="date", how="inner")
             for col in ["close_raw", "close_hfq", "volume", "peTTM", "pbMRQ"]:
@@ -140,13 +151,13 @@ def download_stock_prices(codes: list[str]):
             df.to_parquet(out_path, index=False)
             downloaded += 1
 
-            if i % 50 == 0 or i == total:
-                print(f"[日线下载进度] {i}/{total} (新下载 {downloaded}, 跳过缓存 {skipped})")
+            if downloaded % 25 == 0 or i == total:
+                print(f"[日线下载进度] 扫描 {i}/{total} (新下载 {downloaded}, 跳过缓存 {skipped})")
     finally:
         bs.logout()
 
 
 if __name__ == "__main__":
-    codes = select_candidate_codes(top_n_per_period=80)
+    codes = select_candidate_codes(top_n_overall=80, top_n_per_bucket=45)
     download_stock_prices(codes)
     print("\n✅ 候选池日线数据按需下载完成！")
